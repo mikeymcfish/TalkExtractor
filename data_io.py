@@ -90,6 +90,9 @@ class SourceStats:
     no_text: int = 0
     below_min_words: int = 0
     insufficient_quotes: int = 0
+    merged_tests: int = 0
+    merged_below_min_words: int = 0
+    merged_insufficient_quotes: int = 0
 
 def estimate_speakers(passage: str) -> float:
     """Very rough heuristic of speaker variety based on quotes and attributions."""
@@ -105,7 +108,7 @@ def estimate_speakers(passage: str) -> float:
 
 def iter_passages_streaming(dataset_id: str, split: str = "train", min_words: int = 80,
                             chunk: int = DEF_CHUNK, quote_pairs: int = 0,
-                            stats: Optional[SourceStats] = None):
+                            stats: Optional[SourceStats] = None, pre_filter: bool = True):
     """Stream records without downloading full dataset; yields normalized, chunked passages."""
     ds = load_dataset(dataset_id, split=split, streaming=True)
     for ex in ds:
@@ -120,24 +123,28 @@ def iter_passages_streaming(dataset_id: str, split: str = "train", min_words: in
         for p in split_passages(tx, max_chars=int(chunk)):
             if stats:
                 stats.candidate_passages += 1
-            if len(p.split()) < int(min_words):
-                if stats:
-                    stats.below_min_words += 1
-                continue
-            if quote_pairs and not has_enough_quotes(p, min_pairs=quote_pairs):
-                if stats:
-                    stats.insufficient_quotes += 1
+            keep = True
+            if pre_filter:
+                if len(p.split()) < int(min_words):
+                    keep = False
+                    if stats:
+                        stats.below_min_words += 1
+                elif quote_pairs and not has_enough_quotes(p, min_pairs=quote_pairs):
+                    keep = False
+                    if stats:
+                        stats.insufficient_quotes += 1
+            if not keep:
                 continue
             if stats:
                 stats.yielded_passages += 1
             yield p
 
 def stream_passages(src_mode: str, dataset_id: str, upload_file,
-                    min_words: int, chunk: int, quote_pairs: int = 0) -> Tuple[Iterable[str], str, SourceStats]:
+                    min_words: int, chunk: int, quote_pairs: int = 0, pre_filter: bool = True) -> Tuple[Iterable[str], str, SourceStats]:
     """Return an iterator over filtered passages plus the actual dataset identifier."""
     stats = SourceStats()
     if src_mode == "HF Dataset":
-        LOG.info("Streaming HF dataset '%s' (min_words=%s, chunk=%s, quote_pairs=%s)", dataset_id, min_words, chunk, quote_pairs)
+        LOG.info("Streaming HF dataset '%s' (min_words=%s, chunk=%s, quote_pairs=%s, pre_filter=%s)", dataset_id, min_words, chunk, quote_pairs, pre_filter)
 
         def generator():
             yield from iter_passages_streaming(
@@ -147,6 +154,7 @@ def stream_passages(src_mode: str, dataset_id: str, upload_file,
                 chunk=chunk,
                 quote_pairs=quote_pairs,
                 stats=stats,
+                pre_filter=pre_filter,
             )
 
         return generator(), dataset_id, stats
@@ -163,17 +171,21 @@ def stream_passages(src_mode: str, dataset_id: str, upload_file,
             return
         for p in split_passages(tx, max_chars=int(chunk)):
             stats.candidate_passages += 1
-            if len(p.split()) < int(min_words):
-                stats.below_min_words += 1
-                continue
-            if quote_pairs and not has_enough_quotes(p, min_pairs=quote_pairs):
-                stats.insufficient_quotes += 1
+            keep = True
+            if pre_filter:
+                if len(p.split()) < int(min_words):
+                    keep = False
+                    stats.below_min_words += 1
+                elif quote_pairs and not has_enough_quotes(p, min_pairs=quote_pairs):
+                    keep = False
+                    stats.insufficient_quotes += 1
+            if not keep:
                 continue
             stats.yielded_passages += 1
             yield p
 
     name = getattr(upload_file, "name", "upload.txt")
-    LOG.info("Streaming upload '%s' (min_words=%s, chunk=%s, quote_pairs=%s)", name, min_words, chunk, quote_pairs)
+    LOG.info("Streaming upload '%s' (min_words=%s, chunk=%s, quote_pairs=%s, pre_filter=%s)", name, min_words, chunk, quote_pairs, pre_filter)
     return local_passages(), name, stats
 
 def load_from_hub_or_upload(src_mode: str, dataset_id: str, upload_file, sample: int,

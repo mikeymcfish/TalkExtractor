@@ -4,7 +4,7 @@ import os
 import gradio as gr
 from typing import Any, Dict, List, Optional, Tuple
 
-from data_io import stream_passages, SelectionStats, SourceStats, estimate_speakers
+from data_io import stream_passages, SelectionStats, SourceStats, estimate_speakers, has_enough_quotes
 from teacher import call_teacher, MODEL, INSTRUCTION
 from validators import validate_output
 from exporters import to_jsonl, to_hf_dataset
@@ -102,6 +102,9 @@ def _status_markdown(selection: SelectionStats, source: Optional[SourceStats] = 
             f"- **Filtered (no text):** {source.no_text}",
             f"- **Filtered (below min words):** {source.below_min_words}",
             f"- **Filtered (insufficient dialogue):** {source.insufficient_quotes}",
+            f"- **Merged evaluated:** {source.merged_tests}",
+            f"- **Merged filtered (below min words):** {source.merged_below_min_words}",
+            f"- **Merged filtered (low dialogue):** {source.merged_insufficient_quotes}",
         ])
     return "\n".join(lines)
 
@@ -136,6 +139,7 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
     progress(0.0, desc="Initializing data preparation")
     stats = SelectionStats()
     source_stats: SourceStats = SourceStats()
+    SESSION["source_stats"] = source_stats
     passages: List[str] = []
     records: List[Dict[str, Any]] = []
     pending: List[str] = []
@@ -147,6 +151,15 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
         gen_preview_rows = _preview_rows(passages, start=int(next_idx_value), limit=preview_i)
         return message, status_md, preview_rows, _records_table(records), next_idx_value, gen_preview_rows
 
+    def build_progress_message():
+        return (
+            f"Reading {dataset_id}: selected {stats.selected} "
+            f"(read {stats.read}, skipped {stats.skipped}; no text {source_stats.no_text}, "
+            f"short {source_stats.below_min_words}, low dialogue {source_stats.insufficient_quotes}, "
+            f"merged total {source_stats.merged_tests}, merged short {source_stats.merged_below_min_words}, "
+            f"merged low dialogue {source_stats.merged_insufficient_quotes})."
+        )
+
     try:
         iterator, dataset_id, source_stats = stream_passages(
             src_mode,
@@ -155,6 +168,7 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
             min_words_i,
             chunk_i,
             quote_pairs=qpairs_i,
+            pre_filter=(merge_n <= 1),
         )
     except Exception as exc:
         LOG.exception("Failed to start passage stream: %s", exc)
@@ -175,6 +189,16 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
     cap_reached = False
 
     def process_record(merged_passage: str) -> str:
+        source_stats.merged_tests += 1
+        words = len(merged_passage.split())
+        if words < min_words_i:
+            source_stats.merged_below_min_words += 1
+            LOG.debug("Merged record rejected for min_words (words=%s, required=%s)", words, min_words_i)
+            return "filtered_short"
+        if qpairs_i and not has_enough_quotes(merged_passage, min_pairs=qpairs_i):
+            source_stats.merged_insufficient_quotes += 1
+            LOG.debug("Merged record rejected for insufficient dialogue (required_pairs=%s)", qpairs_i)
+            return "filtered_dialogue"
         stats.note_read()
         if stats.read <= start_i:
             stats.note_skip_start()
@@ -219,13 +243,13 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
         if outcome == "cap":
             cap_reached = True
             break
+        if outcome in ("filtered_short", "filtered_dialogue"):
+            if source_stats.merged_tests <= 1 or source_stats.merged_tests % 25 == 0:
+                yield emit_progress(build_progress_message())
+            continue
 
         if outcome == "selected" or (stats.read % 25 == 0):
-            info = (
-                f"Reading {dataset_id}: selected {stats.selected} "
-                f"(read {stats.read}, skipped {stats.skipped}; no text {source_stats.no_text}, short {source_stats.below_min_words}, low dialogue {source_stats.insufficient_quotes})."
-            )
-            yield emit_progress(info)
+            yield emit_progress(build_progress_message())
 
         if cap and len(passages) >= cap:
             cap_reached = True
@@ -235,12 +259,12 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
         merged = "\n\n".join(pending)
         pending.clear()
         outcome = process_record(merged)
-        if outcome == "selected" or (stats.read % 25 == 0):
-            info = (
-                f"Reading {dataset_id}: selected {stats.selected} "
-                f"(read {stats.read}, skipped {stats.skipped}; no text {source_stats.no_text}, short {source_stats.below_min_words}, low dialogue {source_stats.insufficient_quotes})."
-            )
-            yield emit_progress(info)
+        if outcome == "cap":
+            cap_reached = True
+        elif outcome in ("filtered_short", "filtered_dialogue"):
+            yield emit_progress(build_progress_message())
+        elif outcome == "selected" or (stats.read % 25 == 0):
+            yield emit_progress(build_progress_message())
 
     SESSION["passages"] = passages
     SESSION["dataset_id"] = dataset_id
