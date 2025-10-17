@@ -1,0 +1,1 @@
+Placeholder for teacher.py. Replace with actual code from spec.
