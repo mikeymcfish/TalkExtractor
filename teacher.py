@@ -3,6 +3,8 @@ import os, time
 from typing import Optional
 from openai import OpenAI
 from huggingface_hub import InferenceClient
+import json
+import requests
 
 LOG = logging.getLogger("talk_extractor.teacher")
 
@@ -189,3 +191,114 @@ def call_teacher_hf(passage: str, model: Optional[str] = None, temperature: floa
             prompt = prompt + STRICT_SUFFIX
     LOG.error("HF Teacher failed to return output after %s attempts", max_retries + 1)
     return None
+
+
+def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: float = 0.0, max_retries: int = 2) -> Optional[str]:
+    """Use a local Ollama model for generation.
+
+    - Requires Ollama server running (default http://localhost:11434)
+    - Honors `OLLAMA_BASE_URL` (e.g., http://127.0.0.1:11434)
+    - If the Python `ollama` package is installed, use it; otherwise fall back to HTTP.
+    """
+    ollama_model = model or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
+    LOG.info(
+        "Calling Ollama teacher model=%s temperature=%.2f chars=%s",
+        ollama_model,
+        float(temperature),
+        len(passage),
+    )
+    for attempt in range(max_retries + 1):
+        add_suffix = False
+        try:
+            LOG.debug("Ollama Teacher attempt %s", attempt + 1)
+            options = {}
+            if temperature is not None:
+                try:
+                    options["temperature"] = float(temperature)
+                except Exception:
+                    options["temperature"] = 0.0
+            # Try native client first
+            try:
+                import ollama  # type: ignore
+                res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
+                out = res.get("response") if isinstance(res, dict) else None
+            except Exception:
+                # Fallback to HTTP API
+                payload = {
+                    "model": ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": options,
+                }
+                url = f"{base_url}/api/generate"
+                r = requests.post(url, json=payload, timeout=60)
+                r.raise_for_status()
+                data = r.json()
+                out = data.get("response") if isinstance(data, dict) else None
+            if out and isinstance(out, str) and out.strip():
+                LOG.debug("Ollama Teacher success on attempt %s output_chars=%s", attempt + 1, len(out))
+                return out
+            LOG.warning("Ollama Teacher response empty on attempt %s", attempt + 1)
+            add_suffix = True
+        except Exception as exc:
+            LOG.warning("Ollama Teacher attempt %s failed: %s", attempt + 1, exc)
+            time.sleep(0.5 * (attempt + 1))
+            add_suffix = True
+        if add_suffix:
+            prompt = prompt + STRICT_SUFFIX
+    LOG.error("Ollama Teacher failed to return output after %s attempts", max_retries + 1)
+    return None
+
+
+def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature: float = 0.0):
+    """Yield incremental text chunks from a local Ollama model.
+
+    This is a generator that yields strings as they arrive. It stops when the
+    model signals completion or if an error occurs.
+    """
+    ollama_model = model or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
+    options = {}
+    if temperature is not None:
+        try:
+            options["temperature"] = float(temperature)
+        except Exception:
+            options["temperature"] = 0.0
+    # Prefer python client streaming
+    try:
+        import ollama  # type: ignore
+        stream = ollama.generate(model=ollama_model, prompt=prompt, options=options, stream=True)
+        for part in stream:
+            if isinstance(part, dict):
+                chunk = part.get("response")
+                if isinstance(chunk, str) and chunk:
+                    yield chunk
+            else:
+                # Unknown event type; ignore
+                continue
+        return
+    except Exception:
+        pass
+    # HTTP fallback
+    payload = {
+        "model": ollama_model,
+        "prompt": prompt,
+        "stream": True,
+        "options": options,
+    }
+    url = f"{base_url}/api/generate"
+    with requests.post(url, json=payload, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            chunk = obj.get("response") if isinstance(obj, dict) else None
+            if isinstance(chunk, str) and chunk:
+                yield chunk

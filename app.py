@@ -13,7 +13,11 @@ from data_io import (
     scan_unique_field_values,
     inspect_dataset_fields,
 )
-from teacher import call_teacher, call_teacher_hf, MODEL, INSTRUCTION
+from teacher import call_teacher, call_teacher_hf, call_teacher_ollama, stream_teacher_ollama, MODEL, INSTRUCTION
+import os
+import requests
+from openai import OpenAI as _OpenAIClient
+from huggingface_hub import InferenceClient as _HFClient
 from validators import validate_output
 from exporters import to_jsonl, to_hf_dataset, to_labelstudio
 
@@ -316,10 +320,11 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
     )
     yield snapshot(final_info)
 
-def on_generate(provider: str, model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float) -> Tuple[str, List[List[Any]], float, List[List[Any]]]:
+def on_generate(provider: str, model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float, stream_tokens: bool):
     if not SESSION["passages"]:
         LOG.warning("Generate requested without prepared passages.")
-        return "No passages prepared yet.", [], 0.0, []
+        yield "No passages prepared yet.", [], 0.0, []
+        return
     prov = (provider or "OpenAI").strip()
     if prov == "OpenAI":
         os.environ["OPENAI_MODEL"] = model_name
@@ -329,7 +334,8 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
         start = 0
     if start >= total:
         LOG.warning("Generate start index %s beyond prepared total %s", start, total)
-        return f"Start index {start} is beyond the prepared passages ({total}).", _records_table(), float(total if total else 0), []
+        yield f"Start index {start} is beyond the prepared passages ({total}).", _records_table(), float(total if total else 0), []
+        return
     batch = int(batch_size) if batch_size else (total - start)
     if batch <= 0:
         batch = max(1, total - start)
@@ -361,16 +367,29 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
         for i in range(current_start, end):
             passage = SESSION["passages"][i]
             LOG.debug("Calling teacher for record %s (chars=%s)", i, len(passage))
+            y = ""
             if prov == "HF Inference":
-                y = call_teacher_hf(passage, model=model_name, temperature=float(temperature))
+                y = call_teacher_hf(passage, model=model_name, temperature=float(temperature)) or ""
+            elif prov == "Ollama":
+                if stream_tokens:
+                    acc = []
+                    # stream chunks and update progress
+                    for chunk in stream_teacher_ollama(passage, model=model_name, temperature=float(temperature)):
+                        acc.append(chunk)
+                        preview = ("".join(acc))
+                        # keep preview short to avoid heavy UI updates
+                        short = (preview[:600] + "...") if len(preview) > 600 else preview
+                        yield f"Streaming record {i}: {len(preview)} chars\n\n{short}", _records_table(), float(current_start), []
+                    y = "".join(acc)
+                else:
+                    y = call_teacher_ollama(passage, model=model_name, temperature=float(temperature)) or ""
             else:
-                y = call_teacher(passage, temperature=float(temperature))
+                y = call_teacher(passage, temperature=float(temperature)) or ""
             status = "unreviewed"
             if y and validate_output(y):
                 ok += 1
             else:
                 bad += 1
-                y = y or ""
                 status = "needs_work"
             rec = SESSION["records"][i]
             rec["output"] = y
@@ -379,6 +398,8 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
             rec["meta"]["provider"] = prov
             rec["meta"]["source"] = "LLM"
             LOG.debug("Record %s completed status=%s output_chars=%s", i, status, len(y))
+            # Emit an update after each record completes
+            yield f"Completed record {i} with status {status}.", _records_table(), float(i + 1), _preview_rows(SESSION["passages"], start=i+1, limit=1)
         overall_ok += ok
         overall_bad += bad
         batch_ranges.append((current_start, end - 1 if end > current_start else current_start))
@@ -409,7 +430,7 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
     if preview_limit <= 0:
         preview_limit = batch if batch > 0 else 1
     preview_next = _preview_rows(SESSION["passages"], start=SESSION["next_idx"], limit=preview_limit)
-    return progress_msg, _records_table(), next_start, preview_next
+    yield progress_msg, _records_table(), next_start, preview_next
 
 def on_load(idx: float) -> Tuple[str, str, str]:
     records = SESSION.get("records") or []
@@ -647,7 +668,7 @@ def build_ui():
             )
 
         with gr.Tab("Generation"):
-            provider = gr.Radio(["OpenAI", "HF Inference"], value="OpenAI", label="Provider")
+            provider = gr.Radio(["OpenAI", "HF Inference", "Ollama"], value="OpenAI", label="Provider")
             model_box = gr.Textbox(value=os.getenv("OPENAI_MODEL", MODEL), label="Model id")
             temperature = gr.Slider(0, 1, value=0.0, step=0.1, label="Temperature")
             with gr.Row():
@@ -658,6 +679,8 @@ def build_ui():
                 btn_preview_batch = gr.Button("Preview batch")
                 btn_gen = gr.Button("Generate with OpenAI", variant="primary")
                 btn_cancel_gen = gr.Button("Cancel Generation", variant="stop")
+                btn_test = gr.Button("Test provider/model")
+            stream_chk = gr.Checkbox(value=False, label="Stream tokens (Ollama only)")
             preview_gen_table = gr.Dataframe(
                 value=[],
                 headers=["#", "words", "chars", "preview"],
@@ -666,6 +689,7 @@ def build_ui():
                 datatype=["number", "number", "number", "str"],
             )
             progress_gen = gr.Markdown()
+            test_msg = gr.Markdown()
             rec_table = gr.Dataframe(
                 value=[],
                 headers=["#", "status", "input_chars", "output_chars"],
@@ -782,9 +806,40 @@ def build_ui():
         btn_preview_batch.click(on_preview_batch, [start_idx, batch_size, num_batches], [preview_gen_table])
         gen_event = btn_gen.click(
             on_generate,
-            [provider, model_box, temperature, start_idx, batch_size, num_batches],
+            [provider, model_box, temperature, start_idx, batch_size, num_batches, stream_chk],
             [progress_gen, rec_table, start_idx, preview_gen_table],
         )
+        def on_test_provider(provider: str, model_name: str, temperature: float) -> str:
+            prov = (provider or "OpenAI").strip()
+            name = (model_name or "").strip()
+            try:
+                if prov == "OpenAI":
+                    client = _OpenAIClient()
+                    # Quick metadata check to avoid generating tokens
+                    _ = client.models.retrieve(name)
+                    return f"OpenAI OK: model '{name}' is accessible."
+                if prov == "HF Inference":
+                    token = os.getenv("HF_TOKEN")
+                    cli = _HFClient(model=name or os.getenv("HF_INFERENCE_MODEL") or "")
+                    out = cli.text_generation("ok", max_new_tokens=1, do_sample=False, temperature=0.0, token=token)
+                    if isinstance(out, str):
+                        return f"HF Inference OK: '{name}' responded."
+                    return f"HF Inference responded (non-string): {type(out)}"
+                if prov == "Ollama":
+                    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+                    r = requests.get(f"{base}/api/tags", timeout=5)
+                    if r.status_code != 200:
+                        return f"Ollama error: {r.status_code} {r.text[:200]}"
+                    data = r.json() if r.headers.get("content-type","{}").startswith("application/json") else {}
+                    models = [m.get("name") for m in (data.get("models") or []) if isinstance(m, dict)]
+                    if name in models:
+                        return f"Ollama OK: model '{name}' is available."
+                    return f"Ollama reachable. Model '{name}' not found. Installed: {models}"
+                return f"Unknown provider '{prov}'."
+            except Exception as exc:
+                return f"Test failed for {prov} '{name}': {exc}"
+
+        btn_test.click(on_test_provider, [provider, model_box, temperature], [test_msg])
         btn_cancel_gen.click(lambda: "Generation cancelled.", None, [progress_gen], cancels=[gen_event])
         btn_load.click(load_record_bundle, [idx], [idx, inp, out, status, review_msg])
         btn_prev.click(step_prev, [idx], [idx, inp, out, status, review_msg])

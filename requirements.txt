@@ -7,5 +7,6 @@ pydantic
 pandas
 orjson
 huggingface_hub>=0.24.0
+ollama>=0.3.0
 duckdb
 requests
