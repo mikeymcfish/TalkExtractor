@@ -127,6 +127,40 @@ def _ollama_debug_log(mode: str, source: str, payload: dict, out_text: Optional[
     finally:
         _ollama_debug_logged = True
 
+
+def _ollama_pick_text(payload: dict) -> Optional[str]:
+    """Best-effort extraction of text from various Ollama payload shapes."""
+    if not isinstance(payload, dict):
+        return None
+    # chat shape
+    msg = payload.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg.get("content").strip():
+        return msg.get("content")
+    # generate shape
+    if isinstance(payload.get("response"), str) and payload.get("response").strip():
+        return payload.get("response")
+    # sometimes "content" may appear at top-level
+    if isinstance(payload.get("content"), str) and payload.get("content").strip():
+        return payload.get("content")
+    # some servers may return OpenAI-like choices
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0]
+        if isinstance(c0, dict):
+            if isinstance(c0.get("text"), str) and c0.get("text").strip():
+                return c0.get("text")
+            m = c0.get("message")
+            if isinstance(m, dict) and isinstance(m.get("content"), str) and m.get("content").strip():
+                return m.get("content")
+    return None
+
+
+def _strip_think_safe(text: str, enabled: bool) -> str:
+    if not enabled or not isinstance(text, str):
+        return text
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).replace("<think>", "").replace("</think>", "")
+    return stripped if stripped.strip() else text
+
 def call_teacher(passage: str, temperature: float = 0.0, max_retries: int = 2) -> Optional[str]:
     model = os.getenv("OPENAI_MODEL", MODEL)
     prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
@@ -266,18 +300,17 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                         {"role": "system", "content": INSTRUCTION},
                         {"role": "user", "content": passage},
                     ], options=options)
-                    msg = res.get("message") if isinstance(res, dict) else None
-                    out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                    out = _ollama_pick_text(res if isinstance(res, dict) else {})
                     _ollama_debug_log("chat", "client", res if isinstance(res, dict) else {}, out)
                     # If chat returned empty, try generate as a fallback within the same attempt
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama chat produced empty text; trying generate as fallback.")
                         res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
-                        out = res.get("response") if isinstance(res, dict) else None
+                        out = _ollama_pick_text(res if isinstance(res, dict) else {})
                         _ollama_debug_log("generate", "client", res if isinstance(res, dict) else {}, out)
                 else:
                     res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
-                    out = res.get("response") if isinstance(res, dict) else None
+                    out = _ollama_pick_text(res if isinstance(res, dict) else {})
                     _ollama_debug_log("generate", "client", res if isinstance(res, dict) else {}, out)
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama generate produced empty text; trying chat as fallback.")
@@ -285,8 +318,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                             {"role": "system", "content": INSTRUCTION},
                             {"role": "user", "content": passage},
                         ], options=options)
-                        msg = res.get("message") if isinstance(res, dict) else None
-                        out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                        out = _ollama_pick_text(res if isinstance(res, dict) else {})
                         _ollama_debug_log("chat", "client", res if isinstance(res, dict) else {}, out)
             except Exception:
                 # Fallback to HTTP API
@@ -306,8 +338,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                     data = r.json()
                     if isinstance(data, dict) and data.get("error"):
                         raise RuntimeError(data.get("error"))
-                    msg = data.get("message") if isinstance(data, dict) else None
-                    out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                    out = _ollama_pick_text(data if isinstance(data, dict) else {})
                     _ollama_debug_log("chat", "http", data if isinstance(data, dict) else {}, out)
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama HTTP chat empty; trying HTTP generate fallback.")
@@ -323,7 +354,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                         data = r.json()
                         if isinstance(data, dict) and data.get("error"):
                             raise RuntimeError(data.get("error"))
-                        out = data.get("response") if isinstance(data, dict) else None
+                        out = _ollama_pick_text(data if isinstance(data, dict) else {})
                         _ollama_debug_log("generate", "http", data if isinstance(data, dict) else {}, out)
                 else:
                     payload = {
@@ -338,7 +369,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                     data = r.json()
                     if isinstance(data, dict) and data.get("error"):
                         raise RuntimeError(data.get("error"))
-                    out = data.get("response") if isinstance(data, dict) else None
+                    out = _ollama_pick_text(data if isinstance(data, dict) else {})
                     _ollama_debug_log("generate", "http", data if isinstance(data, dict) else {}, out)
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama HTTP generate empty; trying HTTP chat fallback.")
@@ -357,13 +388,10 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                         data = r.json()
                         if isinstance(data, dict) and data.get("error"):
                             raise RuntimeError(data.get("error"))
-                        msg = data.get("message") if isinstance(data, dict) else None
-                        out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                        out = _ollama_pick_text(data if isinstance(data, dict) else {})
                         _ollama_debug_log("chat", "http", data if isinstance(data, dict) else {}, out)
             if out and isinstance(out, str) and out.strip():
-                if strip_think:
-                    out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
-                    out = out.replace("<think>", "").replace("</think>", "")
+                out = _strip_think_safe(out, strip_think)
                 LOG.debug("Ollama Teacher success on attempt %s output_chars=%s", attempt + 1, len(out))
                 return out
             LOG.warning("Ollama Teacher response empty on attempt %s", attempt + 1)
