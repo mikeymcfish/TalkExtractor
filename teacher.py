@@ -313,6 +313,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
         len(passage),
     )
     max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", os.getenv("NUM_CTX", "0")) or 0)
     strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
     use_chat = os.getenv("OLLAMA_USE_CHAT", "1").strip().lower() in {"1", "true", "yes"}
     for attempt in range(max_retries + 1):
@@ -320,6 +321,8 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
         try:
             LOG.debug("Ollama Teacher attempt %s", attempt + 1)
             options = {"num_predict": max_new}
+            if num_ctx > 0:
+                options["num_ctx"] = num_ctx
             if temperature is not None:
                 try:
                     options["temperature"] = float(temperature)
@@ -450,8 +453,11 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
     max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", os.getenv("NUM_CTX", "0")) or 0)
     strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
     options = {"num_predict": max_new}
+    if num_ctx > 0:
+        options["num_ctx"] = num_ctx
     use_chat = os.getenv("OLLAMA_USE_CHAT", "1").strip().lower() in {"1", "true", "yes"}
     if temperature is not None:
         try:

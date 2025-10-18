@@ -27,6 +27,7 @@ SESSION: Dict[str, Any] = {
     "dataset_id": None,
     "next_idx": 0,
     "source_stats": None,
+    "cancel_generation": False,
 }
 
 DESCRIPTION = (
@@ -349,6 +350,10 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
     batch_ranges: List[Tuple[int, int]] = []
 
     for batch_index in range(batches):
+        if SESSION.get("cancel_generation"):
+            yield "Generation cancelled.", _records_table(), float(current_start), []
+            SESSION["cancel_generation"] = False
+            return
         if current_start >= total:
             break
         current_batch_size = batch if batch > 0 else 1
@@ -365,6 +370,10 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
         )
         ok, bad = 0, 0
         for i in range(current_start, end):
+            if SESSION.get("cancel_generation"):
+                yield "Generation cancelled.", _records_table(), float(i), []
+                SESSION["cancel_generation"] = False
+                return
             passage = SESSION["passages"][i]
             LOG.debug("Calling teacher for record %s (chars=%s)", i, len(passage))
             y = ""
@@ -375,6 +384,9 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
                     acc = []
                     # stream chunks and update progress
                     for chunk in stream_teacher_ollama(passage, model=model_name, temperature=float(temperature)):
+                        if SESSION.get("cancel_generation"):
+                            SESSION["cancel_generation"] = False
+                            break
                         acc.append(chunk)
                         preview = ("".join(acc))
                         # keep preview short to avoid heavy UI updates
@@ -431,6 +443,10 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
         preview_limit = batch if batch > 0 else 1
     preview_next = _preview_rows(SESSION["passages"], start=SESSION["next_idx"], limit=preview_limit)
     yield progress_msg, _records_table(), next_start, preview_next
+
+def on_stop_generation() -> str:
+    SESSION["cancel_generation"] = True
+    return "Stopping generation..."
 
 def on_load(idx: float) -> Tuple[str, str, str]:
     records = SESSION.get("records") or []
@@ -681,12 +697,6 @@ def build_ui():
                 btn_cancel_gen = gr.Button("Cancel Generation", variant="stop")
                 btn_test = gr.Button("Test provider/model")
             stream_chk = gr.Checkbox(value=False, label="Stream tokens (Ollama only)")
-            gr.Markdown("Quick debug send (no prepared data):")
-            debug_input = gr.Textbox(value="\"Hello!\" said John.\n\nMary replied, 'Hi.'", lines=4, label="Debug input passage")
-            with gr.Row():
-                btn_debug_send = gr.Button("Send debug test", variant="secondary")
-                btn_debug_clear = gr.Button("Clear")
-            debug_output = gr.Textbox(value="", lines=10, label="Debug output", interactive=False)
             preview_gen_table = gr.Dataframe(
                 value=[],
                 headers=["#", "words", "chars", "preview"],
@@ -847,37 +857,8 @@ def build_ui():
 
         btn_test.click(on_test_provider, [provider, model_box, temperature], [test_msg])
 
-        def on_debug_send(provider: str, model_name: str, temperature: float, text: str, stream_tokens: bool) -> Tuple[str, str]:
-            prov = (provider or "OpenAI").strip()
-            name = (model_name or "").strip()
-            passage = (text or "").strip()
-            if not passage:
-                return "", "Enter some text to send."
-            try:
-                if prov == "HF Inference":
-                    y = call_teacher_hf(passage, model=name, temperature=float(temperature)) or ""
-                elif prov == "Ollama":
-                    if stream_tokens:
-                        acc = []
-                        for chunk in stream_teacher_ollama(passage, model=name, temperature=float(temperature)):
-                            acc.append(chunk)
-                            # Yielding not supported here; approximate streaming by truncating output
-                            if len(acc) % 10 == 0:  # throttle UI updates
-                                pass
-                        y = "".join(acc)
-                    else:
-                        y = call_teacher_ollama(passage, model=name, temperature=float(temperature)) or ""
-                else:
-                    os.environ["OPENAI_MODEL"] = name
-                    y = call_teacher(passage, temperature=float(temperature)) or ""
-                status = "OK" if y else "Empty response"
-                return y, f"Debug send via {prov} ({name}) → {status}"
-            except Exception as exc:
-                return "", f"Debug send failed via {prov} ({name}): {exc}"
-
-        btn_debug_send.click(on_debug_send, [provider, model_box, temperature, debug_input, stream_chk], [debug_output, progress_gen])
-        btn_debug_clear.click(lambda: ("", ""), None, [debug_output, progress_gen])
-        btn_cancel_gen.click(lambda: "Generation cancelled.", None, [progress_gen], cancels=[gen_event])
+        # Debug send UI removed per user request
+        btn_cancel_gen.click(on_stop_generation, None, [progress_gen], cancels=[gen_event])
         btn_load.click(load_record_bundle, [idx], [idx, inp, out, status, review_msg])
         btn_prev.click(step_prev, [idx], [idx, inp, out, status, review_msg])
         btn_next.click(step_next, [idx], [idx, inp, out, status, review_msg])
