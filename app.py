@@ -858,4 +858,12 @@ def build_ui():
 demo = build_ui()
 
 if __name__ == "__main__":
-    demo.launch()
+    # Allow host/port to be configured via env for platforms like Runpod
+    # Priority: explicit Gradio vars -> app-specific vars -> common PORT default
+    host = os.getenv("GRADIO_SERVER_NAME") or os.getenv("TALK_EXTRACTOR_HOST") or os.getenv("HOST") or "127.0.0.1"
+    port_env = os.getenv("GRADIO_SERVER_PORT") or os.getenv("TALK_EXTRACTOR_PORT") or os.getenv("PORT") or "7860"
+    try:
+        port = int(port_env)
+    except Exception:
+        port = 7860
+    demo.launch(server_name=host, server_port=port)
