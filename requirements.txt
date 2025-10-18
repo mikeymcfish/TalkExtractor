@@ -6,3 +6,6 @@ openai>=1.40.0
 pydantic
 pandas
 orjson
+huggingface_hub>=0.24.0
+duckdb
+requests

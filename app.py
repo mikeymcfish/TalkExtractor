@@ -4,10 +4,18 @@ import os
 import gradio as gr
 from typing import Any, Dict, List, Optional, Tuple
 
-from data_io import stream_passages, SelectionStats, SourceStats, estimate_speakers, has_enough_quotes
-from teacher import call_teacher, MODEL, INSTRUCTION
+from data_io import (
+    stream_passages,
+    SelectionStats,
+    SourceStats,
+    estimate_speakers,
+    has_enough_quotes,
+    scan_unique_field_values,
+    inspect_dataset_fields,
+)
+from teacher import call_teacher, call_teacher_hf, MODEL, INSTRUCTION
 from validators import validate_output
-from exporters import to_jsonl, to_hf_dataset
+from exporters import to_jsonl, to_hf_dataset, to_labelstudio
 
 SESSION: Dict[str, Any] = {
     "passages": [],
@@ -118,7 +126,8 @@ def _load_record(idx: int) -> Tuple[str, str, str]:
 
 
 def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: float, chunk: float,
-               quote_pairs: float, start_record: float, skip_every: float, merge_every: float, preview_count: float):
+               quote_pairs: float, start_record: float, skip_every: float, merge_every: float, preview_count: float,
+               book_field: str, text_field: str, selected_books: list, fast_prepare: bool):
     sample_i = int(sample) if sample else 0
     min_words_i = int(min_words) if min_words else 80
     chunk_i = int(chunk) if chunk else 1200
@@ -169,6 +178,10 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
             chunk_i,
             quote_pairs=qpairs_i,
             pre_filter=(merge_n <= 1),
+            filter_field=(book_field.strip() if (src_mode == "HF Dataset" and selected_books) else None),
+            allowed_values=(selected_books if (src_mode == "HF Dataset" and selected_books) else None),
+            text_field=(text_field.strip() or None),
+            use_fast_prepare=bool(fast_prepare),
         )
     except Exception as exc:
         LOG.exception("Failed to start passage stream: %s", exc)
@@ -182,7 +195,12 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
         return
 
     dataset_id = dataset_id or "(unknown)"
-    info = f"Preparing passages from {dataset_id} (merge every {merge_n})..."
+    book_filter_note = ""
+    if src_mode == "HF Dataset" and selected_books:
+        book_filter_note = f" | filtering {len(selected_books)} value(s) on '{book_field.strip() or '(field)'}'"
+    text_note = f" | text field '{(text_field or '').strip() or '(auto)'}'"
+    fast_note = " | fast SQL" if fast_prepare else ""
+    info = f"Preparing passages from {dataset_id} (merge every {merge_n}{book_filter_note}{text_note}{fast_note})..."
     yield snapshot(info)
 
     skip_gap = max(0, skip_i)
@@ -298,11 +316,13 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
     )
     yield snapshot(final_info)
 
-def on_generate(model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float) -> Tuple[str, List[List[Any]], float, List[List[Any]]]:
+def on_generate(provider: str, model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float) -> Tuple[str, List[List[Any]], float, List[List[Any]]]:
     if not SESSION["passages"]:
         LOG.warning("Generate requested without prepared passages.")
         return "No passages prepared yet.", [], 0.0, []
-    os.environ["OPENAI_MODEL"] = model_name
+    prov = (provider or "OpenAI").strip()
+    if prov == "OpenAI":
+        os.environ["OPENAI_MODEL"] = model_name
     total = len(SESSION["passages"])
     start = int(start_idx) if start_idx is not None else SESSION.get("next_idx", 0)
     if start < 0:
@@ -328,11 +348,12 @@ def on_generate(model_name: str, temperature: float, start_idx: float, batch_siz
         current_batch_size = batch if batch > 0 else 1
         end = min(total, current_start + current_batch_size)
         LOG.info(
-            "Generate batch %s/%s start=%s end=%s model=%s temperature=%.2f",
+            "Generate batch %s/%s start=%s end=%s provider=%s model=%s temperature=%.2f",
             batch_index + 1,
             batches,
             current_start,
             end,
+            prov,
             model_name,
             float(temperature),
         )
@@ -340,7 +361,10 @@ def on_generate(model_name: str, temperature: float, start_idx: float, batch_siz
         for i in range(current_start, end):
             passage = SESSION["passages"][i]
             LOG.debug("Calling teacher for record %s (chars=%s)", i, len(passage))
-            y = call_teacher(passage, temperature=float(temperature))
+            if prov == "HF Inference":
+                y = call_teacher_hf(passage, model=model_name, temperature=float(temperature))
+            else:
+                y = call_teacher(passage, temperature=float(temperature))
             status = "unreviewed"
             if y and validate_output(y):
                 ok += 1
@@ -351,7 +375,8 @@ def on_generate(model_name: str, temperature: float, start_idx: float, batch_siz
             rec = SESSION["records"][i]
             rec["output"] = y
             rec["meta"]["status"] = status
-            rec["meta"]["model"] = os.getenv("OPENAI_MODEL", model_name)
+            rec["meta"]["model"] = model_name
+            rec["meta"]["provider"] = prov
             rec["meta"]["source"] = "LLM"
             LOG.debug("Record %s completed status=%s output_chars=%s", i, status, len(y))
         overall_ok += ok
@@ -504,6 +529,19 @@ def on_export_jsonl() -> Tuple[Any, str]:
     LOG.info("Export complete: %s records with %s outputs", len(records), completed)
     return path, f"Exported {len(records)} records ({completed} with outputs) to {path}."
 
+def on_export_labelstudio() -> Tuple[Any, str]:
+    records = SESSION.get("records") or []
+    if not records:
+        LOG.warning("Label Studio export requested without records.")
+        return None, "No records available to export."
+    path = "workspace/labelstudio_tasks.json"
+    LOG.info("Exporting %s records to Label Studio JSON %s", len(records), path)
+    # include model output if available; LS can show it in the UI
+    to_labelstudio(records, path, include_output=True)
+    completed = sum(1 for r in records if r.get("output"))
+    LOG.info("Label Studio export complete: %s records (%s with outputs)", len(records), completed)
+    return path, f"Exported {len(records)} records ({completed} with outputs) to {path}."
+
 def on_push(push_repo: str, private_toggle: bool) -> str:
     if not push_repo:
         LOG.warning("Push requested without repository name.")
@@ -522,6 +560,49 @@ def on_push(push_repo: str, private_toggle: bool) -> str:
     LOG.info("Push complete: %s records", len(ds))
     return f"Pushed {len(ds)} records to {push_repo}"
 
+def on_scan_books(src_mode: str, dataset_id: str, field: str, cap: float, stride: float, fast_scan: bool, current_selection: list):
+    if src_mode != "HF Dataset":
+        LOG.info("Scan books ignored for mode %s", src_mode)
+        # no choices update; return empty update and message
+        try:
+            return gr.update(choices=[], value=[]), "Switch to 'HF Dataset' to scan books."
+        except Exception:
+            return [], "Switch to 'HF Dataset' to scan books."
+    limit = int(cap) if cap else 500
+    fld = (field or "").strip() or "title"
+    s = int(stride) if stride else 1
+    try:
+        # Prefer new signature with stride
+        values = scan_unique_field_values(dataset_id, fld, limit=limit, fast=bool(fast_scan), stride=s)
+    except TypeError as exc:
+        # Backward-compat: older function impl without stride
+        LOG.info("scan_unique_field_values does not accept stride; retrying without it.")
+        try:
+            values = scan_unique_field_values(dataset_id, fld, limit=limit, fast=bool(fast_scan))
+        except Exception as exc2:
+            LOG.exception("Scan books failed (fallback): %s", exc2)
+            try:
+                return gr.update(choices=[], value=[]), f"Failed to scan: {exc2}"
+            except Exception:
+                return [], f"Failed to scan: {exc2}"
+    except Exception as exc:
+        LOG.exception("Scan books failed: %s", exc)
+        try:
+            return gr.update(choices=[], value=[]), f"Failed to scan: {exc}"
+        except Exception:
+            return [], f"Failed to scan: {exc}"
+    msg = f"Found {len(values)} unique value(s) for '{fld}'. Select to filter during Prepare."
+    # Retain selected values that are still present
+    keep = []
+    if isinstance(current_selection, (list, tuple)):
+        keep = [v for v in current_selection if v in values]
+    # Prefer returning a Gradio update (newer versions)
+    try:
+        return gr.update(choices=values, value=keep), msg
+    except Exception:
+        # Fallback for environments where update isn't available
+        return values, msg
+
 def build_ui():
     with gr.Blocks(title="Dialogue→Speaker Dataset Builder", theme=gr.themes.Default()) as demo:
         gr.Markdown("# Dialogue→Speaker Dataset Builder")
@@ -531,6 +612,17 @@ def build_ui():
             src_mode = gr.Radio(["HF Dataset", "Upload .txt"], value="HF Dataset", label="Source")
             hf_id = gr.Textbox(value="Navanjana/Gutenberg_books", label="HF dataset id (train split)")
             upload = gr.File(file_types=[".txt"], label="Upload a .txt file")
+            with gr.Row():
+                btn_load_fields = gr.Button("Load dataset fields", variant="secondary")
+                book_field = gr.Dropdown(choices=[], value=None, label="Book/ID field")
+                text_field = gr.Dropdown(choices=[], value=None, label="Text field to parse")
+            with gr.Row():
+                scan_cap = gr.Number(value=200, label="Scan up to N books", precision=0)
+                scan_stride = gr.Number(value=1, label="Scan stride (every N rows)", precision=0)
+                fast_scan = gr.Checkbox(value=False, label="Enable fast scan (API)")
+                fast_prepare = gr.Checkbox(value=False, label="Enable fast prepare (parquet/SQL)")
+                btn_scan = gr.Button("Scan books")
+            book_list = gr.Dropdown(choices=[], multiselect=True, label="Books to include (optional)")
             with gr.Row():
                 sample = gr.Number(value=5, label="Sample passages (0 = all)", precision=0)
                 start_record = gr.Number(value=0, label="Start record #", precision=0)
@@ -555,7 +647,8 @@ def build_ui():
             )
 
         with gr.Tab("Generation"):
-            model_box = gr.Textbox(value=os.getenv("OPENAI_MODEL", MODEL), label="OpenAI model")
+            provider = gr.Radio(["OpenAI", "HF Inference"], value="OpenAI", label="Provider")
+            model_box = gr.Textbox(value=os.getenv("OPENAI_MODEL", MODEL), label="Model id")
             temperature = gr.Slider(0, 1, value=0.0, step=0.1, label="Temperature")
             with gr.Row():
                 start_idx = gr.Number(value=0, label="Start record #", precision=0)
@@ -647,6 +740,8 @@ def build_ui():
         with gr.Tab("Export"):
             btn_jsonl = gr.Button("Create JSONL export")
             download_file = gr.File(label="Download JSONL", interactive=False, file_count="single")
+            btn_ls = gr.Button("Create Label Studio JSON")
+            download_ls = gr.File(label="Download Label Studio JSON", interactive=False, file_count="single")
             push_repo = gr.Textbox(value="", label="HF Dataset repo (e.g. yourname/gutenberg_dialogue_v1)")
             private_toggle = gr.Checkbox(value=True, label="Private repo")
             btn_push = gr.Button("Push to Hugging Face Hub")
@@ -655,17 +750,39 @@ def build_ui():
         with gr.Tab("Settings"):
             instr = gr.Textbox(value=INSTRUCTION, lines=14, label="Canonical instruction (read-only)", interactive=False)
             gr.Markdown("Set `OPENAI_API_KEY` & optional `OPENAI_MODEL` in Space Secrets.")
+            with gr.Row():
+                btn_load_fields2 = gr.Button("Load dataset fields", variant="secondary")
+                # duplicate in Settings to make it accessible
+                dummy = gr.Markdown("Use in Data tab to populate field dropdowns.")
+
+        def on_load_fields(dataset_id: str):
+            cols, def_id, def_text = inspect_dataset_fields(dataset_id)
+            msg = (
+                f"Loaded {len(cols)} columns. Default id: {def_id or '(none)'}, text: {def_text or '(none)'}"
+                if cols else "Failed to load dataset fields."
+            )
+            try:
+                return gr.update(choices=cols, value=def_id), gr.update(choices=cols, value=def_text), msg
+            except Exception:
+                return cols, cols, msg
 
         prep_event = btn_prep.click(
             on_prepare,
-            [src_mode, hf_id, upload, sample, min_words, chunk, quote_pairs, start_record, skip_every, merge_every, preview_count],
+            [src_mode, hf_id, upload, sample, min_words, chunk, quote_pairs, start_record, skip_every, merge_every, preview_count, book_field, text_field, book_list, fast_prepare],
             [info_data, status_box, preview_table, rec_table, start_idx, preview_gen_table],
         )
+        btn_scan.click(
+            on_scan_books,
+            [src_mode, hf_id, book_field, scan_cap, scan_stride, fast_scan, book_list],
+            [book_list, info_data],
+        )
+        btn_load_fields.click(on_load_fields, [hf_id], [book_field, text_field, info_data])
+        btn_load_fields2.click(on_load_fields, [hf_id], [book_field, text_field, info_data])
         btn_cancel_prep.click(lambda: "Preparation cancelled.", None, [info_data], cancels=[prep_event])
         btn_preview_batch.click(on_preview_batch, [start_idx, batch_size, num_batches], [preview_gen_table])
         gen_event = btn_gen.click(
             on_generate,
-            [model_box, temperature, start_idx, batch_size, num_batches],
+            [provider, model_box, temperature, start_idx, batch_size, num_batches],
             [progress_gen, rec_table, start_idx, preview_gen_table],
         )
         btn_cancel_gen.click(lambda: "Generation cancelled.", None, [progress_gen], cancels=[gen_event])
@@ -678,6 +795,7 @@ def build_ui():
         hidden_skip_prev.click(on_keyboard_shortcut, [shortcut_left, idx, out], [idx, inp, out, status, review_msg, rec_table])
         hidden_skip_next.click(on_keyboard_shortcut, [shortcut_right, idx, out], [idx, inp, out, status, review_msg, rec_table])
         btn_jsonl.click(on_export_jsonl, [], [download_file, export_msg])
+        btn_ls.click(on_export_labelstudio, [], [download_ls, export_msg])
         btn_push.click(on_push, [push_repo, private_toggle], [export_msg])
 
     return demo
