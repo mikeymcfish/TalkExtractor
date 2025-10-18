@@ -321,7 +321,7 @@ def on_prepare(src_mode: str, hf_id: str, upload, sample: float, min_words: floa
     )
     yield snapshot(final_info)
 
-def on_generate(provider: str, model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float, stream_tokens: bool):
+def on_generate(provider: str, model_name: str, temperature: float, start_idx: float, batch_size: float, num_batches: float, stream_tokens: bool, ollama_choice: Optional[str]):
     if not SESSION["passages"]:
         LOG.warning("Generate requested without prepared passages.")
         yield "No passages prepared yet.", [], 0.0, []
@@ -329,6 +329,10 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
     prov = (provider or "OpenAI").strip()
     if prov == "OpenAI":
         os.environ["OPENAI_MODEL"] = model_name
+    # Choose model name for Ollama if nothing typed
+    eff_model = model_name
+    if prov == "Ollama":
+        eff_model = (model_name or "").strip() or (ollama_choice or "").strip() or os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL") or "llama3"
     total = len(SESSION["passages"])
     start = int(start_idx) if start_idx is not None else SESSION.get("next_idx", 0)
     if start < 0:
@@ -383,7 +387,7 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
                 if stream_tokens:
                     acc = []
                     # stream chunks and update progress
-                    for chunk in stream_teacher_ollama(passage, model=model_name, temperature=float(temperature)):
+                    for chunk in stream_teacher_ollama(passage, model=eff_model, temperature=float(temperature)):
                         if SESSION.get("cancel_generation"):
                             SESSION["cancel_generation"] = False
                             break
@@ -394,7 +398,7 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
                         yield f"Streaming record {i}: {len(preview)} chars\n\n{short}", _records_table(), float(current_start), []
                     y = "".join(acc)
                 else:
-                    y = call_teacher_ollama(passage, model=model_name, temperature=float(temperature)) or ""
+                    y = call_teacher_ollama(passage, model=eff_model, temperature=float(temperature)) or ""
             else:
                 y = call_teacher(passage, temperature=float(temperature)) or ""
             status = "unreviewed"
@@ -406,7 +410,7 @@ def on_generate(provider: str, model_name: str, temperature: float, start_idx: f
             rec = SESSION["records"][i]
             rec["output"] = y
             rec["meta"]["status"] = status
-            rec["meta"]["model"] = model_name
+            rec["meta"]["model"] = eff_model if prov == "Ollama" else model_name
             rec["meta"]["provider"] = prov
             rec["meta"]["source"] = "LLM"
             LOG.debug("Record %s completed status=%s output_chars=%s", i, status, len(y))
@@ -697,6 +701,9 @@ def build_ui():
                 btn_cancel_gen = gr.Button("Cancel Generation", variant="stop")
                 btn_test = gr.Button("Test provider/model")
             stream_chk = gr.Checkbox(value=False, label="Stream tokens (Ollama only)")
+            with gr.Row():
+                ollama_models = gr.Dropdown(choices=[], value=None, label="Installed Ollama models (optional)")
+                btn_refresh_models = gr.Button("Refresh Ollama models")
             preview_gen_table = gr.Dataframe(
                 value=[],
                 headers=["#", "words", "chars", "preview"],
@@ -822,12 +829,14 @@ def build_ui():
         btn_preview_batch.click(on_preview_batch, [start_idx, batch_size, num_batches], [preview_gen_table])
         gen_event = btn_gen.click(
             on_generate,
-            [provider, model_box, temperature, start_idx, batch_size, num_batches, stream_chk],
+            [provider, model_box, temperature, start_idx, batch_size, num_batches, stream_chk, ollama_models],
             [progress_gen, rec_table, start_idx, preview_gen_table],
         )
         def on_test_provider(provider: str, model_name: str, temperature: float) -> str:
             prov = (provider or "OpenAI").strip()
             name = (model_name or "").strip()
+            if prov == "Ollama" and not name:
+                name = os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL") or "llama3"
             try:
                 if prov == "OpenAI":
                     client = _OpenAIClient()
@@ -856,6 +865,36 @@ def build_ui():
                 return f"Test failed for {prov} '{name}': {exc}"
 
         btn_test.click(on_test_provider, [provider, model_box, temperature], [test_msg])
+
+        def on_list_ollama_models(prov: str):
+            if (prov or "").strip() != "Ollama":
+                # Clear list when not in Ollama mode
+                try:
+                    return gr.update(choices=[], value=None), ""
+                except Exception:
+                    return [], ""
+            base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+            try:
+                r = requests.get(f"{base}/api/tags", timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                models = [m.get("name") for m in (data.get("models") or []) if isinstance(m, dict) and m.get("name")]
+            except Exception as exc:
+                try:
+                    return gr.update(choices=[], value=None), f"Failed to load Ollama models: {exc}"
+                except Exception:
+                    return [], f"Failed to load Ollama models: {exc}"
+            # pick default
+            default = os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL")
+            if default not in models:
+                default = (models[0] if models else None)
+            try:
+                return gr.update(choices=models, value=default), f"Loaded {len(models)} Ollama models."
+            except Exception:
+                return models, f"Loaded {len(models)} Ollama models."
+
+        btn_refresh_models.click(on_list_ollama_models, [provider], [ollama_models, test_msg])
+        provider.change(on_list_ollama_models, [provider], [ollama_models, test_msg])
 
         # Debug send UI removed per user request
         btn_cancel_gen.click(on_stop_generation, None, [progress_gen], cancels=[gen_event])

@@ -303,7 +303,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
     - Honors `OLLAMA_BASE_URL` (e.g., http://127.0.0.1:11434)
     - If the Python `ollama` package is installed, use it; otherwise fall back to HTTP.
     """
-    ollama_model = model or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
+    ollama_model = model or os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
     LOG.info(
@@ -449,7 +449,7 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
     This is a generator that yields strings as they arrive. It stops when the
     model signals completion or if an error occurs.
     """
-    ollama_model = model or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
+    ollama_model = model or os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
     max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
