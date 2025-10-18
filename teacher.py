@@ -97,30 +97,64 @@ _OLLAMA_DEBUG = os.getenv("OLLAMA_DEBUG", "").strip().lower() in {"1", "true", "
 _OLLAMA_DEBUG_ONCE = os.getenv("OLLAMA_DEBUG_ONCE", "1").strip().lower() in {"1", "true", "yes"}
 _ollama_debug_logged = False
 
-def _ollama_debug_log(mode: str, source: str, payload: dict, out_text: Optional[str]) -> None:
+def _coerce_payload(obj) -> dict:
+    if isinstance(obj, dict):
+        return obj
+    # Try common serialization methods
+    for attr in ("dict", "model_dump", "to_dict"):
+        try:
+            meth = getattr(obj, attr, None)
+            if callable(meth):
+                d = meth()
+                if isinstance(d, dict):
+                    return d
+        except Exception:
+            pass
+    # Build a minimal dict from known attributes
+    out = {}
+    try:
+        if hasattr(obj, "response"):
+            out["response"] = getattr(obj, "response")
+        if hasattr(obj, "content"):
+            out["content"] = getattr(obj, "content")
+        if hasattr(obj, "message"):
+            m = getattr(obj, "message")
+            md = {}
+            if hasattr(m, "role"):
+                md["role"] = getattr(m, "role")
+            if hasattr(m, "content"):
+                md["content"] = getattr(m, "content")
+            if md:
+                out["message"] = md
+    except Exception:
+        pass
+    return out
+
+
+def _ollama_debug_log(mode: str, source: str, payload_obj, out_text: Optional[str]) -> None:
     global _ollama_debug_logged
     if not _OLLAMA_DEBUG:
         return
     if _OLLAMA_DEBUG_ONCE and _ollama_debug_logged:
         return
     try:
+        payload = _coerce_payload(payload_obj)
         head = (out_text or "")
         if len(head) > 200:
             head = head[:200] + "…"
         # Extract minimal fields from payload to avoid noisy dumps
         sample = {}
-        if isinstance(payload, dict):
-            if "response" in payload and isinstance(payload["response"], str):
-                sample["response_head"] = (payload["response"][:200] + "…") if len(payload["response"]) > 200 else payload["response"]
-            msg = payload.get("message") if isinstance(payload.get("message"), dict) else None
-            if msg and isinstance(msg.get("content"), str):
-                txt = msg.get("content")
-                sample["message_head"] = (txt[:200] + "…") if len(txt) > 200 else txt
-            if "error" in payload:
-                sample["error"] = payload.get("error")
-            for k in ("created_at", "done", "eval_count", "prompt_eval_count"):
-                if k in payload:
-                    sample[k] = payload[k]
+        if "response" in payload and isinstance(payload["response"], str):
+            sample["response_head"] = (payload["response"][:200] + "…") if len(payload["response"]) > 200 else payload["response"]
+        msg = payload.get("message") if isinstance(payload.get("message"), dict) else None
+        if msg and isinstance(msg.get("content"), str):
+            txt = msg.get("content")
+            sample["message_head"] = (txt[:200] + "…") if len(txt) > 200 else txt
+        if "error" in payload:
+            sample["error"] = payload.get("error")
+        for k in ("created_at", "done", "eval_count", "prompt_eval_count"):
+            if k in payload:
+                sample[k] = payload[k]
         LOG.info("OLLAMA DEBUG mode=%s source=%s out_head=%r payload_sample=%s", mode, source, head, json.dumps(sample, ensure_ascii=False))
     except Exception as _:
         pass
@@ -300,26 +334,26 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                         {"role": "system", "content": INSTRUCTION},
                         {"role": "user", "content": passage},
                     ], options=options)
-                    out = _ollama_pick_text(res if isinstance(res, dict) else {})
-                    _ollama_debug_log("chat", "client", res if isinstance(res, dict) else {}, out)
+                    out = _ollama_pick_text(_coerce_payload(res))
+                    _ollama_debug_log("chat", "client", res, out)
                     # If chat returned empty, try generate as a fallback within the same attempt
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama chat produced empty text; trying generate as fallback.")
                         res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
-                        out = _ollama_pick_text(res if isinstance(res, dict) else {})
-                        _ollama_debug_log("generate", "client", res if isinstance(res, dict) else {}, out)
+                        out = _ollama_pick_text(_coerce_payload(res))
+                        _ollama_debug_log("generate", "client", res, out)
                 else:
                     res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
-                    out = _ollama_pick_text(res if isinstance(res, dict) else {})
-                    _ollama_debug_log("generate", "client", res if isinstance(res, dict) else {}, out)
+                    out = _ollama_pick_text(_coerce_payload(res))
+                    _ollama_debug_log("generate", "client", res, out)
                     if not (isinstance(out, str) and out.strip()):
                         LOG.debug("Ollama generate produced empty text; trying chat as fallback.")
                         res = ollama.chat(model=ollama_model, messages=[
                             {"role": "system", "content": INSTRUCTION},
                             {"role": "user", "content": passage},
                         ], options=options)
-                        out = _ollama_pick_text(res if isinstance(res, dict) else {})
-                        _ollama_debug_log("chat", "client", res if isinstance(res, dict) else {}, out)
+                        out = _ollama_pick_text(_coerce_payload(res))
+                        _ollama_debug_log("chat", "client", res, out)
             except Exception:
                 # Fallback to HTTP API
                 if use_chat:
