@@ -211,6 +211,7 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
     )
     max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
     strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
+    use_chat = os.getenv("OLLAMA_USE_CHAT", "1").strip().lower() in {"1", "true", "yes"}
     for attempt in range(max_retries + 1):
         add_suffix = False
         try:
@@ -221,26 +222,53 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                     options["temperature"] = float(temperature)
                 except Exception:
                     options["temperature"] = 0.0
-            # Try native client first
+            # Try native client first (chat preferred)
             try:
                 import ollama  # type: ignore
-                res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
-                out = res.get("response") if isinstance(res, dict) else None
+                if use_chat:
+                    res = ollama.chat(model=ollama_model, messages=[
+                        {"role": "system", "content": INSTRUCTION},
+                        {"role": "user", "content": passage},
+                    ], options=options)
+                    msg = res.get("message") if isinstance(res, dict) else None
+                    out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                else:
+                    res = ollama.generate(model=ollama_model, prompt=prompt, options=options)
+                    out = res.get("response") if isinstance(res, dict) else None
             except Exception:
                 # Fallback to HTTP API
-                payload = {
-                    "model": ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": options,
-                }
-                url = f"{base_url}/api/generate"
-                r = requests.post(url, json=payload, timeout=60)
-                r.raise_for_status()
-                data = r.json()
-                if isinstance(data, dict) and data.get("error"):
-                    raise RuntimeError(data.get("error"))
-                out = data.get("response") if isinstance(data, dict) else None
+                if use_chat:
+                    payload = {
+                        "model": ollama_model,
+                        "messages": [
+                            {"role": "system", "content": INSTRUCTION},
+                            {"role": "user", "content": passage},
+                        ],
+                        "stream": False,
+                        "options": options,
+                    }
+                    url = f"{base_url}/api/chat"
+                    r = requests.post(url, json=payload, timeout=120)
+                    r.raise_for_status()
+                    data = r.json()
+                    if isinstance(data, dict) and data.get("error"):
+                        raise RuntimeError(data.get("error"))
+                    msg = data.get("message") if isinstance(data, dict) else None
+                    out = (msg or {}).get("content") if isinstance(msg, dict) else None
+                else:
+                    payload = {
+                        "model": ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": options,
+                    }
+                    url = f"{base_url}/api/generate"
+                    r = requests.post(url, json=payload, timeout=120)
+                    r.raise_for_status()
+                    data = r.json()
+                    if isinstance(data, dict) and data.get("error"):
+                        raise RuntimeError(data.get("error"))
+                    out = data.get("response") if isinstance(data, dict) else None
             if out and isinstance(out, str) and out.strip():
                 if strip_think:
                     out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
@@ -271,6 +299,7 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
     max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
     strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
     options = {"num_predict": max_new}
+    use_chat = os.getenv("OLLAMA_USE_CHAT", "1").strip().lower() in {"1", "true", "yes"}
     if temperature is not None:
         try:
             options["temperature"] = float(temperature)
@@ -279,35 +308,72 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
     # Prefer python client streaming
     try:
         import ollama  # type: ignore
-        stream = ollama.generate(model=ollama_model, prompt=prompt, options=options, stream=True)
-        for part in stream:
-            if isinstance(part, dict):
-                chunk = part.get("response")
-                if isinstance(chunk, str) and chunk:
-                    yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
-            else:
-                # Unknown event type; ignore
-                continue
-        return
+        if use_chat:
+            stream = ollama.chat(model=ollama_model, messages=[
+                {"role": "system", "content": INSTRUCTION},
+                {"role": "user", "content": passage},
+            ], options=options, stream=True)
+            for part in stream:
+                if isinstance(part, dict):
+                    msg = part.get("message")
+                    chunk = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(chunk, str) and chunk:
+                        yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
+            return
+        else:
+            stream = ollama.generate(model=ollama_model, prompt=prompt, options=options, stream=True)
+            for part in stream:
+                if isinstance(part, dict):
+                    chunk = part.get("response")
+                    if isinstance(chunk, str) and chunk:
+                        yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
+                else:
+                    continue
+            return
     except Exception:
         pass
     # HTTP fallback
-    payload = {
-        "model": ollama_model,
-        "prompt": prompt,
-        "stream": True,
-        "options": options,
-    }
-    url = f"{base_url}/api/generate"
-    with requests.post(url, json=payload, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            chunk = obj.get("response") if isinstance(obj, dict) else None
-            if isinstance(chunk, str) and chunk:
-                yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
+    if use_chat:
+        payload = {
+            "model": ollama_model,
+            "messages": [
+                {"role": "system", "content": INSTRUCTION},
+                {"role": "user", "content": passage},
+            ],
+            "stream": True,
+            "options": options,
+        }
+        url = f"{base_url}/api/chat"
+        with requests.post(url, json=payload, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                msg = obj.get("message") if isinstance(obj, dict) else None
+                chunk = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(chunk, str) and chunk:
+                    yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
+    else:
+        payload = {
+            "model": ollama_model,
+            "prompt": prompt,
+            "stream": True,
+            "options": options,
+        }
+        url = f"{base_url}/api/generate"
+        with requests.post(url, json=payload, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                chunk = obj.get("response") if isinstance(obj, dict) else None
+                if isinstance(chunk, str) and chunk:
+                    yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
