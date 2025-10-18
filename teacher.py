@@ -1,5 +1,5 @@
 import logging
-import os, time
+import os, time, re
 from typing import Optional
 from openai import OpenAI
 from huggingface_hub import InferenceClient
@@ -209,11 +209,13 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
         float(temperature),
         len(passage),
     )
+    max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
+    strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
     for attempt in range(max_retries + 1):
         add_suffix = False
         try:
             LOG.debug("Ollama Teacher attempt %s", attempt + 1)
-            options = {}
+            options = {"num_predict": max_new}
             if temperature is not None:
                 try:
                     options["temperature"] = float(temperature)
@@ -236,8 +238,13 @@ def call_teacher_ollama(passage: str, model: Optional[str] = None, temperature: 
                 r = requests.post(url, json=payload, timeout=60)
                 r.raise_for_status()
                 data = r.json()
+                if isinstance(data, dict) and data.get("error"):
+                    raise RuntimeError(data.get("error"))
                 out = data.get("response") if isinstance(data, dict) else None
             if out and isinstance(out, str) and out.strip():
+                if strip_think:
+                    out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
+                    out = out.replace("<think>", "").replace("</think>", "")
                 LOG.debug("Ollama Teacher success on attempt %s output_chars=%s", attempt + 1, len(out))
                 return out
             LOG.warning("Ollama Teacher response empty on attempt %s", attempt + 1)
@@ -261,7 +268,9 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
     ollama_model = model or os.getenv("OLLAMA_MODEL") or os.getenv("HF_DEFAULT_MODEL", "llama3")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     prompt = f"{INSTRUCTION}\n\nText:\n{passage}"
-    options = {}
+    max_new = int(os.getenv("OLLAMA_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "700")) or 700)
+    strip_think = os.getenv("OLLAMA_STRIP_THINK", "").strip().lower() in {"1", "true", "yes"}
+    options = {"num_predict": max_new}
     if temperature is not None:
         try:
             options["temperature"] = float(temperature)
@@ -275,7 +284,7 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
             if isinstance(part, dict):
                 chunk = part.get("response")
                 if isinstance(chunk, str) and chunk:
-                    yield chunk
+                    yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
             else:
                 # Unknown event type; ignore
                 continue
@@ -301,4 +310,4 @@ def stream_teacher_ollama(passage: str, model: Optional[str] = None, temperature
                 continue
             chunk = obj.get("response") if isinstance(obj, dict) else None
             if isinstance(chunk, str) and chunk:
-                yield chunk
+                yield (re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL).replace("<think>", "").replace("</think>", "") if strip_think else chunk)
