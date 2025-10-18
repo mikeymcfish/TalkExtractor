@@ -681,6 +681,12 @@ def build_ui():
                 btn_cancel_gen = gr.Button("Cancel Generation", variant="stop")
                 btn_test = gr.Button("Test provider/model")
             stream_chk = gr.Checkbox(value=False, label="Stream tokens (Ollama only)")
+            gr.Markdown("Quick debug send (no prepared data):")
+            debug_input = gr.Textbox(value="\"Hello!\" said John.\n\nMary replied, 'Hi.'", lines=4, label="Debug input passage")
+            with gr.Row():
+                btn_debug_send = gr.Button("Send debug test", variant="secondary")
+                btn_debug_clear = gr.Button("Clear")
+            debug_output = gr.Textbox(value="", lines=10, label="Debug output", interactive=False)
             preview_gen_table = gr.Dataframe(
                 value=[],
                 headers=["#", "words", "chars", "preview"],
@@ -840,6 +846,37 @@ def build_ui():
                 return f"Test failed for {prov} '{name}': {exc}"
 
         btn_test.click(on_test_provider, [provider, model_box, temperature], [test_msg])
+
+        def on_debug_send(provider: str, model_name: str, temperature: float, text: str, stream_tokens: bool) -> Tuple[str, str]:
+            prov = (provider or "OpenAI").strip()
+            name = (model_name or "").strip()
+            passage = (text or "").strip()
+            if not passage:
+                return "", "Enter some text to send."
+            try:
+                if prov == "HF Inference":
+                    y = call_teacher_hf(passage, model=name, temperature=float(temperature)) or ""
+                elif prov == "Ollama":
+                    if stream_tokens:
+                        acc = []
+                        for chunk in stream_teacher_ollama(passage, model=name, temperature=float(temperature)):
+                            acc.append(chunk)
+                            # Yielding not supported here; approximate streaming by truncating output
+                            if len(acc) % 10 == 0:  # throttle UI updates
+                                pass
+                        y = "".join(acc)
+                    else:
+                        y = call_teacher_ollama(passage, model=name, temperature=float(temperature)) or ""
+                else:
+                    os.environ["OPENAI_MODEL"] = name
+                    y = call_teacher(passage, temperature=float(temperature)) or ""
+                status = "OK" if y else "Empty response"
+                return y, f"Debug send via {prov} ({name}) → {status}"
+            except Exception as exc:
+                return "", f"Debug send failed via {prov} ({name}): {exc}"
+
+        btn_debug_send.click(on_debug_send, [provider, model_box, temperature, debug_input, stream_chk], [debug_output, progress_gen])
+        btn_debug_clear.click(lambda: ("", ""), None, [debug_output, progress_gen])
         btn_cancel_gen.click(lambda: "Generation cancelled.", None, [progress_gen], cancels=[gen_event])
         btn_load.click(load_record_bundle, [idx], [idx, inp, out, status, review_msg])
         btn_prev.click(step_prev, [idx], [idx, inp, out, status, review_msg])
