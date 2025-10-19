@@ -866,13 +866,34 @@ def build_ui():
 
         btn_test.click(on_test_provider, [provider, model_box, temperature], [test_msg])
 
+        def _btn_label_for_provider(prov: str) -> str:
+            p = (prov or "OpenAI").strip()
+            return {
+                "OpenAI": "Generate with OpenAI",
+                "HF Inference": "Generate with HF Inference",
+                "Ollama": "Generate with Ollama",
+            }.get(p, "Generate")
+
+        def on_provider_ui(prov: str):
+            # Update button label and suggest an env default model into the textbox
+            label = _btn_label_for_provider(prov)
+            default_model = os.getenv("OPENAI_MODEL", MODEL)
+            if (prov or "").strip() == "HF Inference":
+                default_model = os.getenv("HF_INFERENCE_MODEL") or os.getenv("HF_DEFAULT_MODEL", "")
+            elif (prov or "").strip() == "Ollama":
+                default_model = os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL") or "llama3"
+            try:
+                return gr.update(value=label), gr.update(value=default_model)
+            except Exception:
+                return label, default_model
+
         def on_list_ollama_models(prov: str):
             if (prov or "").strip() != "Ollama":
                 # Clear list when not in Ollama mode
                 try:
-                    return gr.update(choices=[], value=None), ""
+                    return gr.update(choices=[], value=None), gr.update(value=""), ""
                 except Exception:
-                    return [], ""
+                    return [], "", ""
             base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
             try:
                 r = requests.get(f"{base}/api/tags", timeout=10)
@@ -881,20 +902,30 @@ def build_ui():
                 models = [m.get("name") for m in (data.get("models") or []) if isinstance(m, dict) and m.get("name")]
             except Exception as exc:
                 try:
-                    return gr.update(choices=[], value=None), f"Failed to load Ollama models: {exc}"
+                    return gr.update(choices=[], value=None), gr.update(value=""), f"Failed to load Ollama models: {exc}"
                 except Exception:
-                    return [], f"Failed to load Ollama models: {exc}"
+                    return [], "", f"Failed to load Ollama models: {exc}"
             # pick default
             default = os.getenv("OLLAMA_DEFAULT") or os.getenv("OLLAMA_MODEL")
             if default not in models:
                 default = (models[0] if models else None)
             try:
-                return gr.update(choices=models, value=default), f"Loaded {len(models)} Ollama models."
+                return gr.update(choices=models, value=default), gr.update(value=(default or "")), f"Loaded {len(models)} Ollama models."
             except Exception:
-                return models, f"Loaded {len(models)} Ollama models."
+                return models, (default or ""), f"Loaded {len(models)} Ollama models."
 
-        btn_refresh_models.click(on_list_ollama_models, [provider], [ollama_models, test_msg])
-        provider.change(on_list_ollama_models, [provider], [ollama_models, test_msg])
+        btn_refresh_models.click(on_list_ollama_models, [provider], [ollama_models, model_box, test_msg])
+        provider.change(on_list_ollama_models, [provider], [ollama_models, model_box, test_msg])
+        # Also update button label and suggest default model when provider changes
+        provider.change(on_provider_ui, [provider], [btn_gen, model_box])
+
+        # When a model is picked from dropdown, reflect it in the textbox on top
+        def on_pick_ollama_model(name: str):
+            try:
+                return gr.update(value=name or "")
+            except Exception:
+                return name or ""
+        ollama_models.change(on_pick_ollama_model, [ollama_models], [model_box])
 
         # Debug send UI removed per user request
         btn_cancel_gen.click(on_stop_generation, None, [progress_gen], cancels=[gen_event])
